@@ -1,0 +1,147 @@
+# ScreenConnect Web App Pipeline
+# Uses the existing 'ScreenConnect-Variables' variable group
+# 
+# Required variables to add to the variable group:
+# - AZURE_SERVICE_CONNECTION: Azure service connection name
+# - CONTAINER_REGISTRY_CONNECTION: Container registry service connection name
+# - CONTAINER_REGISTRY_URL: Container registry URL (e.g., yourregistry.azurecr.io)
+# - CONTAINER_REGISTRY_USERNAME: Container registry username
+# - CONTAINER_REGISTRY_PASSWORD: Container registry password
+
+trigger:
+  branches:
+    include:
+    - main
+  paths:
+    include:
+    - webapp/**
+    exclude:
+    - webapp/README.md
+    - webapp/**/*.md
+    - webapp/**/*.txt
+    - webapp/deployment/README.md
+
+pr:
+  branches:
+    include:
+    - main
+  paths:
+    include:
+    - webapp/**
+    exclude:
+    - webapp/README.md
+    - webapp/**/*.md
+    - webapp/**/*.txt
+    - webapp/deployment/README.md
+
+variables:
+  - group: 'ScreenConnect-Variables'
+  
+  # Container Registry variables
+  - name: 'imageRepository'
+    value: 'screenconnect-webapp'
+  - name: 'dockerfilePath'
+    value: 'webapp/Dockerfile'
+  - name: 'tag'
+    value: '$(Build.BuildId)'
+  
+  # Azure resources
+  - name: 'webAppName'
+    value: '$(WEB_APP_NAME)'
+  
+  # Build variables
+  - name: 'buildConfiguration'
+    value: 'Release'
+
+stages:
+- stage: Build
+  displayName: Build and Push Docker Image
+  jobs:
+  - job: Build
+    displayName: Build
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: Docker@2
+      displayName: 'Build Docker Image'
+      inputs:
+        containerRegistry: '$(CONTAINER_REGISTRY_CONNECTION)'
+        repository: '$(imageRepository)'
+        command: 'build'
+        Dockerfile: '$(dockerfilePath)'
+        buildContext: 'webapp'
+        tags: |
+          $(tag)
+          latest
+
+    # Install Trivy vulnerability scanner
+    - script: |
+        sudo apt-get update
+        sudo apt-get install wget apt-transport-https gnupg lsb-release
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+        echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+        sudo apt-get update
+        sudo apt-get install trivy
+      displayName: 'Install Trivy Scanner'
+
+    # Scan Docker image for vulnerabilities
+    - script: |
+        trivy image --exit-code 0 --format sarif --output trivy-results.sarif $(CONTAINER_REGISTRY_URL)/$(imageRepository):$(tag)
+        trivy image --exit-code 1 --severity HIGH,CRITICAL $(CONTAINER_REGISTRY_URL)/$(imageRepository):$(tag)
+      displayName: 'Scan Docker Image for Vulnerabilities'
+      continueOnError: false
+
+    # Publish vulnerability scan results
+    - task: PublishTestResults@2
+      displayName: 'Publish Trivy Scan Results'
+      inputs:
+        testResultsFormat: 'VSTest'
+        testResultsFiles: 'trivy-results.sarif'
+        failTaskOnFailedTests: false
+      condition: always()
+
+    # Upload vulnerability report as artifact
+    - task: PublishBuildArtifacts@1
+      displayName: 'Upload Vulnerability Report'
+      inputs:
+        PathtoPublish: 'trivy-results.sarif'
+        ArtifactName: 'vulnerability-report'
+        publishLocation: 'Container'
+      condition: always()
+
+    - task: Docker@2
+      displayName: 'Push Docker Image'
+      inputs:
+        containerRegistry: '$(CONTAINER_REGISTRY_CONNECTION)'
+        repository: '$(imageRepository)'
+        command: 'push'
+        tags: |
+          $(tag)
+          latest
+
+- stage: DeployProd
+  displayName: Deploy to Production
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: Deploy
+    displayName: Deploy to Azure Web App
+    environment: 'production'
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureWebAppContainer@1
+            displayName: 'Deploy Container to Web App'
+            inputs:
+              azureSubscription: '$(AZURE_SERVICE_CONNECTION)'
+              appName: '$(webAppName)'
+              containers: '$(CONTAINER_REGISTRY_URL)/$(imageRepository):$(tag)'
+              # Registry authentication
+              containerRegistry: '$(CONTAINER_REGISTRY_CONNECTION)'
+              # App settings for the container (single line format)
+              appSettings: '-DOCKER_REGISTRY_SERVER_URL $(CONTAINER_REGISTRY_URL) -DOCKER_REGISTRY_SERVER_USERNAME $(CONTAINER_REGISTRY_USERNAME) -DOCKER_REGISTRY_SERVER_PASSWORD $(CONTAINER_REGISTRY_PASSWORD) -SCREENCONNECT_BASE_URL $(SCREENCONNECT_BASE_URL) -ASPNETCORE_ENVIRONMENT Production -WEBSITE_TIME_ZONE UTC'
+              # Startup command if needed
+              containerCommand: 'dotnet ScreenConnect.WebApp.dll' 

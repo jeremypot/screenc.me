@@ -1,0 +1,28 @@
+[package]
+name = "screenconnect-extractor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zip = "2.0"
+
+[build-dependencies]
+winres = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Static linking for maximum compatibility
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[[bin]]
+name = "screenconnect-extractor"
+path = "src/main.rs" 
